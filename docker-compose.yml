@@ -1,0 +1,148 @@
+# =============================================================================
+# Immich + NSFW Sidecar — Full Stack with NVIDIA CUDA (RTX 4070 Ti Super)
+# =============================================================================
+# Usage:
+#   1. Copy .env.example to .env and fill in your values
+#   2. docker compose up -d
+#   3. Access Immich at http://localhost:2283
+#   4. Create admin account, then set up users/albums
+# =============================================================================
+
+name: immich
+
+services:
+  # ---------------------------------------------------------------------------
+  # Immich Server — API, web UI, background jobs, video transcoding
+  # ---------------------------------------------------------------------------
+  immich-server:
+    container_name: immich_server
+    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
+    volumes:
+      - ${UPLOAD_LOCATION}:/usr/src/app/upload
+      - /etc/localtime:/etc/localtime:ro
+    env_file:
+      - .env
+    ports:
+      - '2283:2283'
+    depends_on:
+      redis:
+        condition: service_healthy
+      database:
+        condition: service_healthy
+    restart: always
+    healthcheck:
+      disable: false
+    # NVENC hardware transcoding for video
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+                - video
+
+  # ---------------------------------------------------------------------------
+  # Immich Machine Learning — face detection, facial recognition, CLIP search
+  # Uses CUDA image for GPU-accelerated inference on RTX 4070 Ti Super
+  # ---------------------------------------------------------------------------
+  immich-machine-learning:
+    container_name: immich_machine_learning
+    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-release}-cuda
+    volumes:
+      - model-cache:/cache
+    env_file:
+      - .env
+    restart: always
+    healthcheck:
+      disable: false
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL with vector extensions (for CLIP embeddings + smart search)
+  # ---------------------------------------------------------------------------
+  database:
+    container_name: immich_postgres
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_DB: ${DB_DATABASE_NAME}
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+    volumes:
+      - ${DB_DATA_LOCATION}:/var/lib/postgresql/data
+    healthcheck:
+      test: "pg_isready --dbname='${DB_DATABASE_NAME}' --username='${DB_USERNAME}' || exit 1; Chksum=\"$$(psql --dbname='${DB_DATABASE_NAME}' --username='${DB_USERNAME}' --tuples-only --no-align --command='SELECT COALESCE(SUM(checksum_failures), 0) FROM pg_catalog.pg_stat_database')\"; echo \"checksum: $$Chksum\""
+      interval: 5m
+      start_interval: 30s
+      start_period: 5m
+    command:
+      [
+        'postgres',
+        '-c',
+        'shared_preload_libraries=vchord',
+        '-c',
+        'search_path="$$user", public, vectors',
+        '-c',
+        'logging_collector=on',
+        '-c',
+        'max_wal_size=2GB',
+        '-c',
+        'shared_buffers=512MB',
+        '-c',
+        'wal_compression=on',
+      ]
+    restart: always
+
+  # ---------------------------------------------------------------------------
+  # Valkey (Redis-compatible) — caching and job queue
+  # ---------------------------------------------------------------------------
+  redis:
+    container_name: immich_redis
+    image: docker.io/valkey/valkey:8-bookworm
+    healthcheck:
+      test: valkey-cli ping || exit 1
+    restart: always
+
+  # ---------------------------------------------------------------------------
+  # NSFW Watcher Sidecar — classifies uploads and tags via Immich API
+  # ---------------------------------------------------------------------------
+  nsfw-watcher:
+    container_name: nsfw_watcher
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ${UPLOAD_LOCATION}:/watch:ro
+      - nsfw-cache:/app/cache
+    environment:
+      - IMMICH_API_URL=http://immich-server:2283
+      - IMMICH_API_KEY=${NSFW_SIDECAR_API_KEY}
+      - NSFW_THRESHOLD=${NSFW_THRESHOLD:-0.75}
+      - NSFW_ALBUM_NAME=${NSFW_ALBUM_NAME:-NSFW}
+      - POLL_INTERVAL=${NSFW_POLL_INTERVAL:-30}
+      - NVIDIA_VISIBLE_DEVICES=all
+    depends_on:
+      immich-server:
+        condition: service_healthy
+    restart: always
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+
+volumes:
+  model-cache:
+  nsfw-cache:
